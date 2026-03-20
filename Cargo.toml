@@ -20,22 +20,14 @@ tokio-util = "0.7.17"
 [dev-dependencies]
 tempfile = "3"
 
-[patch.crates-io]
-mprocs = { git = "https://github.com/baileylu121/mprocs", rev = "0d762fb2b11d1f0e01ee74894918592779310b0e" }
-
 [package]
 name = "nimi"
 version = "0.1.0"
 edition = "2024"
 
+[patch.crates-io]
+mprocs = {git = "https://github.com/baileylu121/mprocs", rev = "b0f230fae5f155d0903ff8f73d0ccd68074b2fb3"}
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
-
-[[bin]]
-name = "nimi"
-path = "src/bin/nimi.rs"
-
-[[bin]]
-name = "nimi-tui"
-path = "src/bin/nimi-tui.rs"
