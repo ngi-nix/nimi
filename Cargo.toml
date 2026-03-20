@@ -26,7 +26,7 @@ version = "0.1.0"
 edition = "2024"
 
 [patch.crates-io]
-mprocs = {git = "https://github.com/baileylu121/mprocs", rev = "b0f230fae5f155d0903ff8f73d0ccd68074b2fb3"}
+mprocs = {git = "https://github.com/baileylu121/mprocs", rev = "0dd01b97c3a40d28a517d951900f30f22e54f791"}
 
 [profile.release]
 codegen-units = 1

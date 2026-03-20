@@ -5,7 +5,7 @@
 
 use eyre::{Context, Result};
 use futures::future::OptionFuture;
-use lib::{ProcConfig, StopSignal, mprocs};
+use libmprocs::{ProcConfig, StopSignal, mprocs};
 use log::{debug, info};
 use std::process::Stdio;
 use std::{collections::HashMap, env, io::ErrorKind, path::PathBuf, sync::Arc};
@@ -222,7 +222,7 @@ impl ProcessManager {
                 .wrap_err_with(|| format!("Failed to create config dir for {}", name))?;
         }
 
-        mprocs::run_with_config(self.into(), lib::Settings::default())
+        mprocs::run_with_config(self.into(), libmprocs::Settings::default())
             .await
             .map_err(|e| eyre::eyre!("{e:?}"))
             .wrap_err("Failed to launch mprocs TUI")

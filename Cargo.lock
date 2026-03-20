@@ -1063,7 +1063,7 @@ dependencies = [
 [[package]]
 name = "mprocs"
 version = "0.8.2"
-source = "git+https://github.com/baileylu121/mprocs?rev=0d762fb2b11d1f0e01ee74894918592779310b0e#0d762fb2b11d1f0e01ee74894918592779310b0e"
+source = "git+https://github.com/baileylu121/mprocs?rev=0dd01b97c3a40d28a517d951900f30f22e54f791#0dd01b97c3a40d28a517d951900f30f22e54f791"
 dependencies = [
  "anyhow",
  "assert_matches",

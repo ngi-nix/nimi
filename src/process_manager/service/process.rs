@@ -1,5 +1,5 @@
 use eyre::{Error, Result, eyre};
-use lib::CmdConfig;
+use libmprocs::CmdConfig;
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
