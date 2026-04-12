@@ -12,6 +12,7 @@ use std::{
 use eyre::{Context, Result};
 use log::{debug, info};
 use thiserror::Error;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio::{
     process::{Child, Command},
@@ -40,6 +41,9 @@ pub struct ServiceManager {
 
     config_dir: ConfigDir,
     logs_dir: Arc<Option<PathBuf>>,
+
+    /// Fires once after the first successful process spawn to unblock dependents
+    started_signal: Option<watch::Sender<bool>>,
 }
 
 /// Errors which can occur during service management
@@ -71,6 +75,9 @@ pub struct ServiceManagerOpts {
 
     /// Cancellation token
     pub cancel_tok: CancellationToken,
+
+    /// Channel to signal when the first process spawn succeeds
+    pub started_signal: Option<watch::Sender<bool>>,
 }
 
 impl ServiceManager {
@@ -92,6 +99,7 @@ impl ServiceManager {
 
             current_restart_count: 0,
             logs_dir: opts.logs_dir,
+            started_signal: opts.started_signal,
         })
     }
 
@@ -220,6 +228,11 @@ impl ServiceManager {
         }
 
         let (process, _guard) = self.create_service_child().await?;
+
+        if let Some(tx) = self.started_signal.take() {
+            let _ = tx.send(true);
+        }
+
         self.run_with_loggers(process).await
     }
 

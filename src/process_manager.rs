@@ -10,8 +10,11 @@ use log::{debug, info};
 use std::process::Stdio;
 use std::{collections::HashMap, env, io::ErrorKind, path::PathBuf, sync::Arc};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 use tokio::{fs, process::Command, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+
+use crate::config::ServiceOrdering;
 
 pub mod service;
 pub mod service_manager;
@@ -32,12 +35,98 @@ use crate::subreaper::Subreaper;
 pub struct ProcessManager {
     services: HashMap<String, Service>,
     settings: Settings,
+    ordering: HashMap<String, ServiceOrdering>,
 }
 
 impl ProcessManager {
     /// Create a new process manager instance
-    pub fn new(services: HashMap<String, Service>, settings: Settings) -> Self {
-        Self { services, settings }
+    pub fn new(
+        services: HashMap<String, Service>,
+        settings: Settings,
+        ordering: HashMap<String, ServiceOrdering>,
+    ) -> Self {
+        Self {
+            services,
+            settings,
+            ordering,
+        }
+    }
+
+    /// Validate that the ordering config is consistent with the service set.
+    ///
+    /// Checks that every name referenced in `ordering` (both keys and `after`
+    /// entries) corresponds to an actual service, and that the dependency graph
+    /// is acyclic.
+    pub fn validate_ordering(&self) -> Result<()> {
+        for (name, order) in &self.ordering {
+            eyre::ensure!(
+                self.services.contains_key(name),
+                "ordering references unknown service: {name}"
+            );
+            for dep in &order.after {
+                eyre::ensure!(
+                    self.services.contains_key(dep),
+                    "ordering.{name}.after references unknown service: {dep}"
+                );
+            }
+        }
+
+        self.detect_cycles()
+    }
+
+    /// Detect cycles in the ordering graph via iterative DFS.
+    fn detect_cycles(&self) -> Result<()> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Mark {
+            Temporary,
+            Permanent,
+        }
+
+        let mut marks: HashMap<&str, Mark> = HashMap::new();
+
+        for start in self.services.keys() {
+            if marks.get(start.as_str()) == Some(&Mark::Permanent) {
+                continue;
+            }
+
+            let mut stack: Vec<(&str, usize)> = vec![(start.as_str(), 0)];
+            marks.insert(start.as_str(), Mark::Temporary);
+
+            while let Some((node, idx)) = stack.last_mut() {
+                let deps = self
+                    .ordering
+                    .get(*node)
+                    .map(|o| o.after.as_slice())
+                    .unwrap_or(&[]);
+
+                if *idx >= deps.len() {
+                    marks.insert(node, Mark::Permanent);
+                    stack.pop();
+                    continue;
+                }
+
+                let dep = deps[*idx].as_str();
+                *idx += 1;
+
+                match marks.get(dep) {
+                    Some(Mark::Permanent) => {}
+                    Some(Mark::Temporary) => {
+                        let cycle: Vec<&str> = stack
+                            .iter()
+                            .map(|(n, _)| *n)
+                            .skip_while(|n| *n != dep)
+                            .collect();
+                        eyre::bail!("dependency cycle detected: {} -> {dep}", cycle.join(" -> "));
+                    }
+                    None => {
+                        marks.insert(dep, Mark::Temporary);
+                        stack.push((dep, 0));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn run_startup_process(&self, bin: &str, cancel_tok: &CancellationToken) -> Result<()> {
@@ -114,11 +203,15 @@ impl ProcessManager {
 
     /// Spawn Child Processes
     ///
-    /// Spawns every service this process manager manages into a `JoinSet`
+    /// Spawns every service this process manager manages into a `JoinSet`,
+    /// respecting `ordering` constraints. Services wait for their `after`
+    /// dependencies to have spawned before starting.
     pub async fn spawn_child_processes(
         self,
         cancel_tok: &CancellationToken,
     ) -> Result<JoinSet<Result<()>>> {
+        self.validate_ordering()?;
+
         let mut join_set = tokio::task::JoinSet::new();
 
         let settings = Arc::new(self.settings);
@@ -135,19 +228,56 @@ impl ProcessManager {
         );
         let tmp_dir = Arc::new(env::temp_dir());
 
+        let mut senders: HashMap<String, watch::Sender<bool>> = HashMap::new();
+        let mut receivers: HashMap<String, watch::Receiver<bool>> = HashMap::new();
+        for name in self.services.keys() {
+            let (tx, rx) = watch::channel(false);
+            senders.insert(name.clone(), tx);
+            receivers.insert(name.clone(), rx);
+        }
+
         for (name, service) in self.services {
+            let dep_names: Vec<String> = self
+                .ordering
+                .get(&name)
+                .map(|o| o.after.clone())
+                .unwrap_or_default();
+
+            let dep_rxs: Vec<watch::Receiver<bool>> = dep_names
+                .iter()
+                .map(|dep| receivers.get(dep).expect("validated").clone())
+                .collect();
+
+            let started_signal = senders.remove(&name);
+            let cancel = cancel_tok.clone();
+
             let opts = ServiceManagerOpts {
                 logs_dir: Arc::clone(&logs_dir),
                 tmp_dir: Arc::clone(&tmp_dir),
 
                 settings: Arc::clone(&settings),
 
-                name: Arc::new(name),
+                name: Arc::new(name.clone()),
                 service,
                 cancel_tok: cancel_tok.clone(),
+                started_signal,
             };
 
-            join_set.spawn(async move { ServiceManager::new(opts).await?.run().await });
+            join_set.spawn(async move {
+                for (mut rx, dep) in dep_rxs.into_iter().zip(dep_names.iter()) {
+                    tokio::select! {
+                        result = rx.wait_for(|v| *v) => {
+                            result.map_err(|_| eyre::eyre!(
+                                "dependency {dep} failed before service {} could start",
+                                opts.name
+                            ))?;
+                        }
+                        _ = cancel.cancelled() => return Ok(()),
+                    }
+                }
+
+                ServiceManager::new(opts).await?.run().await
+            });
         }
 
         Ok(join_set)
@@ -234,21 +364,29 @@ impl From<ProcessManager> for Vec<ProcConfig> {
         value
             .services
             .into_iter()
-            .map(|(name, service)| ProcConfig {
-                name,
-                cmd: service.process.into(),
-                cwd: std::env::current_dir().ok().map(|p| p.into_os_string()),
-                env: None,
-                autostart: true,
-                autorestart: value.settings.autorestart(),
+            .map(|(name, service)| {
+                let deps = value
+                    .ordering
+                    .get(&name)
+                    .map(|o| o.after.clone())
+                    .unwrap_or_default();
 
-                stop: StopSignal::SIGTERM,
+                ProcConfig {
+                    name,
+                    cmd: service.process.into(),
+                    cwd: std::env::current_dir().ok().map(|p| p.into_os_string()),
+                    env: None,
+                    autostart: true,
+                    autorestart: value.settings.autorestart(),
 
-                deps: Vec::default(),
+                    stop: StopSignal::SIGTERM,
 
-                mouse_scroll_speed: 5,
-                scrollback_len: 1000,
-                log: None,
+                    deps,
+
+                    mouse_scroll_speed: 5,
+                    scrollback_len: 1000,
+                    log: None,
+                }
             })
             .collect()
     }
