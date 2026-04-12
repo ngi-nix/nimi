@@ -145,11 +145,72 @@ impl ServiceManager {
         Ok(())
     }
 
+    /// Runs the pre-start script for this service, if configured.
+    ///
+    /// Spawns the binary with `XDG_CONFIG_HOME` set to the service's config dir,
+    /// pipes stdout/stderr through loggers, and waits for it to complete.
+    async fn run_pre_start(&self, bin: &str) -> Result<()> {
+        let mut set = JoinSet::new();
+
+        let (mut process, _child_guard) = {
+            let _pause = Subreaper::pause_reaping();
+            let process = Command::new(bin)
+                .env("XDG_CONFIG_HOME", &self.config_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .wrap_err_with(|| {
+                    format!(
+                        "Failed to spawn pre-start binary for {}: {:?}",
+                        self.name, bin
+                    )
+                })?;
+            let guard =
+                Subreaper::track_child(process.id()).wrap_err("Failed to track pre-start child")?;
+            (process, guard)
+        };
+
+        Logger::Stdout.start(
+            &mut process.stdout,
+            Arc::clone(&self.name),
+            Arc::clone(&self.logs_dir),
+            &mut set,
+        )?;
+        Logger::Stderr.start(
+            &mut process.stderr,
+            Arc::clone(&self.name),
+            Arc::clone(&self.logs_dir),
+            &mut set,
+        )?;
+
+        tokio::select! {
+            _ = self.cancel_tok.cancelled() => {
+                debug!(target: &self.name, "Received shutdown signal during pre-start");
+                Self::shutdown_process(&mut process, self.settings.restart.time).await?;
+            }
+            status = process.wait() => {
+                let status = status.wrap_err("Failed to get pre-start process status")?;
+                eyre::ensure!(
+                    status.success(),
+                    ServiceError::ProcessExited { status }
+                );
+            }
+        }
+
+        set.join_all().await.into_iter().collect()
+    }
+
     /// Spawns a service process
     ///
     /// Attaches loggers and `wait`s on the process, forwarding
     /// shutdown sequeneces
     pub async fn spawn_service_process(&mut self) -> Result<()> {
+        if let Some(pre_start) = &self.service.pre_start {
+            info!(target: &self.name, "Running pre-start script ({})", pre_start);
+            self.run_pre_start(pre_start).await?;
+        }
+
         let (mut process, _child_guard) = self.create_service_child().await?;
         let mut set = JoinSet::new();
 
