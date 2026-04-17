@@ -22,4 +22,8 @@ pub struct Service {
 
     /// Process configuration
     pub process: Process,
+
+    /// Optional binary to run before each start of this service
+    #[serde(rename = "preStart")]
+    pub pre_start: Option<String>,
 }

@@ -145,12 +145,34 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// Spawns a service process
+    /// Spawn a process with common setup
     ///
-    /// Attaches loggers and `wait`s on the process, forwarding
-    /// shutdown sequeneces
-    pub async fn spawn_service_process(&mut self) -> Result<()> {
-        let (mut process, _child_guard) = self.create_service_child().await?;
+    /// Handles Subreaper pausing, env vars, stdout/stderr piping,
+    /// and child tracking.
+    async fn spawn_process(
+        &self,
+        binary: &str,
+        args: &[&str],
+        error_context: &str,
+    ) -> Result<(Child, ChildGuard)> {
+        let _pause = Subreaper::pause_reaping();
+        let mut cmd = Command::new(binary);
+        if !args.is_empty() {
+            cmd.args(args);
+        }
+        let child = cmd
+            .env("XDG_CONFIG_HOME", &self.config_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .wrap_err_with(|| error_context.to_string())?;
+        let guard = Subreaper::track_child(child.id()).wrap_err("Failed to track child")?;
+        Ok((child, guard))
+    }
+
+    /// Attach loggers to a process and wait for completion.
+    async fn run_with_loggers(&self, mut process: Child) -> Result<()> {
         let mut set = JoinSet::new();
 
         Logger::Stdout.start(
@@ -173,14 +195,32 @@ impl ServiceManager {
             }
             status = process.wait() => {
                 let status = status.wrap_err("Failed to get process status")?;
-                eyre::ensure!(
-                    status.success(),
-                    ServiceError::ProcessExited { status }
-                );
+                eyre::ensure!(status.success(), ServiceError::ProcessExited { status });
             }
         }
 
         set.join_all().await.into_iter().collect()
+    }
+
+    /// Runs the pre-start script for this service, if configured.
+    async fn run_pre_start(&self, bin: &str) -> Result<()> {
+        let error_ctx = format!(
+            "Failed to spawn pre-start binary for {}: {:?}",
+            self.name, bin
+        );
+        let (process, _guard) = self.spawn_process(bin, &[], &error_ctx).await?;
+        self.run_with_loggers(process).await
+    }
+
+    /// Spawns a service process
+    pub async fn spawn_service_process(&mut self) -> Result<()> {
+        if let Some(pre_start) = &self.service.pre_start {
+            info!(target: &self.name, "Running pre-start script ({})", pre_start);
+            self.run_pre_start(pre_start).await?;
+        }
+
+        let (process, _guard) = self.create_service_child().await?;
+        self.run_with_loggers(process).await
     }
 
     /// Kill a service process gracefully
@@ -216,24 +256,19 @@ impl ServiceManager {
     /// Responsible for creating the actual child process for the
     /// service
     pub async fn create_service_child(&self) -> Result<(Child, ChildGuard)> {
-        let _pause = Subreaper::pause_reaping();
-        let process = Command::new(self.service.process.argv.binary())
-            .args(self.service.process.argv.args())
-            .env("XDG_CONFIG_HOME", &self.config_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to start process for service: {:?}",
-                    self.service.process
-                )
-            })?;
-
-        let guard =
-            Subreaper::track_child(process.id()).wrap_err("Failed to track service child")?;
-
-        Ok((process, guard))
+        let error_ctx = format!(
+            "Failed to start process for service: {:?}",
+            self.service.process
+        );
+        let args: Vec<&str> = self
+            .service
+            .process
+            .argv
+            .args()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        self.spawn_process(self.service.process.argv.binary(), &args, &error_ctx)
+            .await
     }
 }
