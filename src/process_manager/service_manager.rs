@@ -145,6 +145,32 @@ impl ServiceManager {
         Ok(())
     }
 
+    /// Spawn a process with common setup
+    ///
+    /// Handles Subreaper pausing, env vars, stdout/stderr piping,
+    /// and child tracking.
+    async fn spawn_process(
+        &self,
+        binary: &str,
+        args: &[&str],
+        error_context: &str,
+    ) -> Result<(Child, ChildGuard)> {
+        let _pause = Subreaper::pause_reaping();
+        let mut cmd = Command::new(binary);
+        if !args.is_empty() {
+            cmd.args(args);
+        }
+        let child = cmd
+            .env("XDG_CONFIG_HOME", &self.config_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .wrap_err_with(|| error_context.to_string())?;
+        let guard = Subreaper::track_child(child.id()).wrap_err("Failed to track child")?;
+        Ok((child, guard))
+    }
+
     /// Runs the pre-start script for this service, if configured.
     ///
     /// Spawns the binary with `XDG_CONFIG_HOME` set to the service's config dir,
@@ -152,24 +178,11 @@ impl ServiceManager {
     async fn run_pre_start(&self, bin: &str) -> Result<()> {
         let mut set = JoinSet::new();
 
-        let (mut process, _child_guard) = {
-            let _pause = Subreaper::pause_reaping();
-            let process = Command::new(bin)
-                .env("XDG_CONFIG_HOME", &self.config_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .wrap_err_with(|| {
-                    format!(
-                        "Failed to spawn pre-start binary for {}: {:?}",
-                        self.name, bin
-                    )
-                })?;
-            let guard =
-                Subreaper::track_child(process.id()).wrap_err("Failed to track pre-start child")?;
-            (process, guard)
-        };
+        let error_ctx = format!(
+            "Failed to spawn pre-start binary for {}: {:?}",
+            self.name, bin
+        );
+        let (mut process, _child_guard) = self.spawn_process(bin, &[], &error_ctx).await?;
 
         Logger::Stdout.start(
             &mut process.stdout,
@@ -277,24 +290,19 @@ impl ServiceManager {
     /// Responsible for creating the actual child process for the
     /// service
     pub async fn create_service_child(&self) -> Result<(Child, ChildGuard)> {
-        let _pause = Subreaper::pause_reaping();
-        let process = Command::new(self.service.process.argv.binary())
-            .args(self.service.process.argv.args())
-            .env("XDG_CONFIG_HOME", &self.config_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to start process for service: {:?}",
-                    self.service.process
-                )
-            })?;
-
-        let guard =
-            Subreaper::track_child(process.id()).wrap_err("Failed to track service child")?;
-
-        Ok((process, guard))
+        let error_ctx = format!(
+            "Failed to start process for service: {:?}",
+            self.service.process
+        );
+        let args: Vec<&str> = self
+            .service
+            .process
+            .argv
+            .args()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        self.spawn_process(self.service.process.argv.binary(), &args, &error_ctx)
+            .await
     }
 }
