@@ -13,6 +13,9 @@ pub struct ServiceOrdering {
     /// Services that must have started before this one is spawned
     #[serde(default)]
     pub after: Vec<String>,
+    /// Services that must be ready before this one starts (requires readyCheck on target)
+    #[serde(default, rename = "afterReady")]
+    pub after_ready: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -69,6 +69,18 @@ impl ProcessManager {
                     "ordering.{name}.after references unknown service: {dep}"
                 );
             }
+            for dep in &order.after_ready {
+                eyre::ensure!(
+                    self.services.contains_key(dep),
+                    "ordering.{name}.afterReady references unknown service: {dep}"
+                );
+                let target_service = self.services.get(dep).expect("validated");
+                eyre::ensure!(
+                    target_service.ready_check.is_some(),
+                    "ordering.{name}.afterReady references service {} without readyCheck: {dep}",
+                    dep
+                );
+            }
         }
 
         self.detect_cycles()
@@ -228,27 +240,44 @@ impl ProcessManager {
         );
         let tmp_dir = Arc::new(env::temp_dir());
 
-        let mut senders: HashMap<String, watch::Sender<bool>> = HashMap::new();
-        let mut receivers: HashMap<String, watch::Receiver<bool>> = HashMap::new();
+        let mut spawn_senders: HashMap<String, watch::Sender<bool>> = HashMap::new();
+        let mut spawn_receivers: HashMap<String, watch::Receiver<bool>> = HashMap::new();
+        let mut ready_senders: HashMap<String, watch::Sender<bool>> = HashMap::new();
+        let mut ready_receivers: HashMap<String, watch::Receiver<bool>> = HashMap::new();
         for name in self.services.keys() {
-            let (tx, rx) = watch::channel(false);
-            senders.insert(name.clone(), tx);
-            receivers.insert(name.clone(), rx);
+            let (spawn_tx, spawn_rx) = watch::channel(false);
+            spawn_senders.insert(name.clone(), spawn_tx);
+            spawn_receivers.insert(name.clone(), spawn_rx);
+            let (ready_tx, ready_rx) = watch::channel(false);
+            ready_senders.insert(name.clone(), ready_tx);
+            ready_receivers.insert(name.clone(), ready_rx);
         }
 
         for (name, service) in self.services {
-            let dep_names: Vec<String> = self
+            let spawn_dep_names: Vec<String> = self
                 .ordering
                 .get(&name)
                 .map(|o| o.after.clone())
                 .unwrap_or_default();
 
-            let dep_rxs: Vec<watch::Receiver<bool>> = dep_names
+            let ready_dep_names: Vec<String> = self
+                .ordering
+                .get(&name)
+                .map(|o| o.after_ready.clone())
+                .unwrap_or_default();
+
+            let spawn_rxs: Vec<watch::Receiver<bool>> = spawn_dep_names
                 .iter()
-                .map(|dep| receivers.get(dep).expect("validated").clone())
+                .map(|dep| spawn_receivers.get(dep).expect("validated").clone())
                 .collect();
 
-            let started_signal = senders.remove(&name);
+            let ready_rxs: Vec<watch::Receiver<bool>> = ready_dep_names
+                .iter()
+                .map(|dep| ready_receivers.get(dep).expect("validated").clone())
+                .collect();
+
+            let spawn_signal = spawn_senders.remove(&name);
+            let ready_signal = ready_senders.remove(&name);
             let cancel = cancel_tok.clone();
 
             let opts = ServiceManagerOpts {
@@ -260,11 +289,12 @@ impl ProcessManager {
                 name: Arc::new(name.clone()),
                 service,
                 cancel_tok: cancel_tok.clone(),
-                started_signal,
+                started_signal: spawn_signal,
+                ready_signal: ready_signal.clone(),
             };
 
             join_set.spawn(async move {
-                for (mut rx, dep) in dep_rxs.into_iter().zip(dep_names.iter()) {
+                for (mut rx, dep) in spawn_rxs.into_iter().zip(spawn_dep_names.iter()) {
                     tokio::select! {
                         result = rx.wait_for(|v| *v) => {
                             result.map_err(|_| eyre::eyre!(
@@ -276,7 +306,34 @@ impl ProcessManager {
                     }
                 }
 
-                ServiceManager::new(opts).await?.run().await
+                for (mut rx, dep) in ready_rxs.into_iter().zip(ready_dep_names.iter()) {
+                    tokio::select! {
+                        result = rx.wait_for(|v| *v) => {
+                            result.map_err(|_| eyre::eyre!(
+                                "dependency {dep} not ready before service {} could start",
+                                opts.name
+                            ))?;
+                        }
+                        _ = cancel.cancelled() => return Ok(()),
+                    }
+                }
+
+                let mut manager = ServiceManager::new(opts).await?;
+                let run_result = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        Ok::<_, eyre::Report>(())
+                    }
+                    result = manager.run() => {
+                        result
+                    }
+                };
+                if run_result.is_ok()
+                    && let Some(tx) = ready_signal
+                {
+                    let _ = tx.send(true);
+                }
+
+                Ok(())
             });
         }
 

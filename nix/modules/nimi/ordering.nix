@@ -1,16 +1,12 @@
 { lib, config, ... }:
 let
-  inherit (lib) mkOption types;
+  inherit (lib)
+    mkOption
+    types
+    ;
 
-  serviceNames = builtins.attrNames config.services;
-
-  referencedDeps = lib.pipe config.ordering [
-    builtins.attrValues
-    (map (o: o.after))
-    lib.flatten
-  ];
-
-  orderingKeys = builtins.attrNames config.ordering;
+  serviceNames = lib.attrNames config.services;
+  orderingKeys = lib.attrNames config.ordering;
 in
 {
   _class = "nimi";
@@ -33,32 +29,58 @@ in
         frontend.after = [ "database" "backend" ];
       }
     '';
-    type = types.attrsOf (types.submodule {
-      options.after = mkOption {
-        description = ''
-          List of service names that must have started before this
-          service is spawned.
-        '';
-        type = types.listOf types.str;
-        default = [ ];
-      };
-    });
+    type = types.attrsOf (
+      types.submodule {
+        options.after = mkOption {
+          description = ''
+            List of service names that must have started before this
+            service is spawned.
+          '';
+          type = types.listOf types.str;
+          default = [ ];
+        };
+        options.afterReady = mkOption {
+          description = ''
+            List of service names that must be ready before this
+            service is spawned. Each target must declare a
+            readiness check.
+          '';
+          type = types.listOf types.str;
+          default = [ ];
+        };
+      }
+    );
     default = { };
   };
 
   config.assertions =
     let
       mkKeyAssertion = name: {
-        assertion = builtins.elem name serviceNames;
+        assertion = lib.elem name serviceNames;
         message = "ordering.${name} references a service that does not exist.";
       };
 
-      mkDepAssertions = name: deps:
+      mkAfterAssertions =
+        name: deps:
         map (dep: {
-          assertion = builtins.elem dep serviceNames;
+          assertion = lib.elem dep serviceNames;
           message = "ordering.${name}.after references unknown service \"${dep}\".";
+        }) deps;
+
+      mkAfterReadyAssertions =
+        name: deps:
+        map (dep: {
+          assertion = lib.elem dep serviceNames;
+          message = "ordering.${name}.afterReady references unknown service \"${dep}\".";
+        }) deps
+        ++ map (dep: {
+          assertion = config.services.${dep}.readyCheck != null;
+          message = "ordering.${name}.afterReady references service \"${dep}\" without readyCheck.";
         }) deps;
     in
     (map mkKeyAssertion orderingKeys)
-    ++ (lib.concatLists (lib.mapAttrsToList (name: o: mkDepAssertions name o.after) config.ordering));
+    ++ (lib.concatLists (lib.mapAttrsToList (name: o: mkAfterAssertions name o.after) config.ordering))
+    ++ (lib.concatLists (
+      lib.mapAttrsToList (name: o: mkAfterReadyAssertions name o.afterReady) config.ordering
+    ));
 }
