@@ -17,6 +17,7 @@ use crate::process_manager::service::ConfigDataMap;
 ///
 /// Generates a reusable per service temp dir using a hash of the
 /// configuration data
+#[derive(Clone)]
 pub struct ConfigDir(PathBuf);
 
 impl ConfigDir {
@@ -79,5 +80,12 @@ impl ConfigDir {
 impl AsRef<OsStr> for ConfigDir {
     fn as_ref(&self) -> &OsStr {
         self.0.as_ref()
+    }
+}
+
+impl ConfigDir {
+    /// Returns the path to the configuration directory
+    pub fn path(&self) -> &PathBuf {
+        &self.0
     }
 }

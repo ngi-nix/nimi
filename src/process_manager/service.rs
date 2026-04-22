@@ -26,4 +26,8 @@ pub struct Service {
     /// Optional binary to run before each start of this service
     #[serde(rename = "preStart")]
     pub pre_start: Option<String>,
+
+    /// Optional readiness probe command - runs after spawn until exit 0
+    #[serde(rename = "readyCheck")]
+    pub ready_check: Option<String>,
 }
