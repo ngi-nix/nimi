@@ -4,6 +4,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod ordering;
 pub mod process_manager;
 pub mod subreaper;
 
