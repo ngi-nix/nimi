@@ -13,6 +13,9 @@ pub struct ServiceOrdering {
     /// Services that must have started before this one is spawned
     #[serde(default)]
     pub after: Vec<String>,
+    /// Services that should start before this one (soft ordering)
+    #[serde(default)]
+    pub before: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

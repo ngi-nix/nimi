@@ -8,9 +8,11 @@ use futures::future::OptionFuture;
 use libmprocs::{ProcConfig, StopSignal, mprocs};
 use log::{debug, info};
 use std::process::Stdio;
-use std::{collections::HashMap, env, io::ErrorKind, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap, env, io::ErrorKind, path::PathBuf, process::ExitStatus, sync::Arc,
+};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
+use tokio::sync::broadcast;
 use tokio::{fs, process::Command, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +32,21 @@ use crate::process_manager::service_manager::{
 };
 use crate::subreaper::Subreaper;
 
+/// Lifecycle events emitted by services via the broadcast event bus.
+#[derive(Clone, Debug)]
+pub enum ServiceEvent {
+    /// Service process has been successfully spawned
+    Spawned(String),
+    /// Service is ready (emitted after postStart succeeds for simple, or on successful exit for oneshot)
+    Ready(String),
+    /// Service process failed with the given exit status
+    Failed(String, ExitStatus),
+    /// Service was stopped (graceful shutdown)
+    Stopped(String),
+    /// Service is being restarted
+    Restarting(String),
+}
+
 /// Process Manager Struct
 ///
 /// Responsible for starting the services and streaming their outputs to the console
@@ -37,6 +54,7 @@ pub struct ProcessManager {
     services: HashMap<String, Service>,
     settings: Settings,
     ordering: HashMap<String, ServiceOrdering>,
+    event_tx: broadcast::Sender<ServiceEvent>,
 }
 
 impl ProcessManager {
@@ -50,6 +68,7 @@ impl ProcessManager {
             services,
             settings,
             ordering,
+            event_tx: broadcast::Sender::new(32),
         }
     }
 
@@ -206,28 +225,24 @@ impl ProcessManager {
         );
         let tmp_dir = Arc::new(env::temp_dir());
 
-        let mut senders: HashMap<String, watch::Sender<bool>> = HashMap::new();
-        let mut receivers: HashMap<String, watch::Receiver<bool>> = HashMap::new();
-        for name in self.services.keys() {
-            let (tx, rx) = watch::channel(false);
-            senders.insert(name.clone(), tx);
-            receivers.insert(name.clone(), rx);
-        }
+        let after_deps: HashMap<String, Vec<String>> = self
+            .services
+            .keys()
+            .map(|name| {
+                let deps = self
+                    .ordering
+                    .get(name)
+                    .map(|o| o.after.clone())
+                    .unwrap_or_default();
+                (name.clone(), deps)
+            })
+            .collect();
 
         for (name, service) in self.services {
-            let dep_names: Vec<String> = self
-                .ordering
-                .get(&name)
-                .map(|o| o.after.clone())
-                .unwrap_or_default();
-
-            let dep_rxs: Vec<watch::Receiver<bool>> = dep_names
-                .iter()
-                .map(|dep| receivers.get(dep).expect("validated").clone())
-                .collect();
-
-            let started_signal = senders.remove(&name);
+            let deps = after_deps.get(&name).cloned().unwrap_or_default();
             let cancel = cancel_tok.clone();
+            let event_tx = self.event_tx.clone();
+            let mut event_rx = self.event_tx.subscribe();
 
             let opts = ServiceManagerOpts {
                 logs_dir: Arc::clone(&logs_dir),
@@ -238,23 +253,47 @@ impl ProcessManager {
                 name: Arc::new(name.clone()),
                 service,
                 cancel_tok: cancel_tok.clone(),
-                started_signal,
+                event_tx: event_tx.clone(),
             };
 
             join_set.spawn(async move {
-                for (mut rx, dep) in dep_rxs.into_iter().zip(dep_names.iter()) {
+                // Wait for all `after` dependencies to be satisfied.
+                // For simple deps: satisfied when they are spawned.
+                // For oneshot deps: satisfied when they complete (Ready or Failed).
+                let mut satisfied: HashMap<String, bool> =
+                    deps.iter().map(|d| (d.clone(), false)).collect();
+
+                loop {
+                    let all_done = satisfied.values().all(|v| *v);
+                    if all_done { 
+                        break;
+                    }
+
                     tokio::select! {
-                        result = rx.wait_for(|v| *v) => {
-                            result.map_err(|_| eyre::eyre!(
-                                "dependency {dep} failed before service {} could start",
-                                opts.name
-                            ))?;
+                        event = event_rx.recv() => {
+                            let event = event.map_err(|e| eyre::eyre!("event channel closed: {e}"))?;
+                            match event {
+                                ServiceEvent::Spawned(ref dep) => {
+                                    // Simple deps are satisfied on spawn
+                                    if let Some(sat) = satisfied.get_mut(dep) {
+                                        *sat = true;
+                                    }
+                                }
+                                ServiceEvent::Ready(ref dep) | ServiceEvent::Failed(ref dep, _) => {
+                                    // Oneshot deps are satisfied on completion
+                                    if let Some(sat) = satisfied.get_mut(dep) {
+                                        *sat = true;
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                         _ = cancel.cancelled() => return Ok(()),
                     }
                 }
 
-                ServiceManager::new(opts).await?.run().await
+                let mut manager = ServiceManager::new(opts).await?;
+                manager.run().await
             });
         }
 
