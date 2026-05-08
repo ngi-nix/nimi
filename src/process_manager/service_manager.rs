@@ -12,8 +12,8 @@ use std::{
 use eyre::{Context, Result};
 use log::{debug, info};
 use thiserror::Error;
-use tokio::sync::watch;
-use tokio::time::timeout;
+use tokio::sync::broadcast;
+use tokio::time::timeout as tokio_timeout;
 use tokio::{
     process::{Child, Command},
     task::JoinSet,
@@ -26,7 +26,7 @@ pub use config_dir::ConfigDir;
 pub use logger::Logger;
 use tokio_util::sync::CancellationToken;
 
-use crate::process_manager::{Service, Settings, settings::RestartMode};
+use crate::process_manager::{Service, ServiceEvent, ServiceType, Settings, settings::RestartMode};
 use crate::subreaper::{ChildGuard, Subreaper};
 
 /// Responsible for the running of and managing of service state
@@ -42,8 +42,7 @@ pub struct ServiceManager {
     config_dir: ConfigDir,
     logs_dir: Arc<Option<PathBuf>>,
 
-    /// Fires once after the first successful process spawn to unblock dependents
-    started_signal: Option<watch::Sender<bool>>,
+    event_tx: broadcast::Sender<ServiceEvent>,
 }
 
 /// Errors which can occur during service management
@@ -76,8 +75,8 @@ pub struct ServiceManagerOpts {
     /// Cancellation token
     pub cancel_tok: CancellationToken,
 
-    /// Channel to signal when the first process spawn succeeds
-    pub started_signal: Option<watch::Sender<bool>>,
+    /// Event bus for lifecycle signals
+    pub event_tx: broadcast::Sender<ServiceEvent>,
 }
 
 impl ServiceManager {
@@ -99,7 +98,7 @@ impl ServiceManager {
 
             current_restart_count: 0,
             logs_dir: opts.logs_dir,
-            started_signal: opts.started_signal,
+            event_tx: opts.event_tx,
         })
     }
 
@@ -108,6 +107,10 @@ impl ServiceManager {
     /// This will handle restarts, attach logging processes and manage linking the config
     /// directory.
     pub async fn run(&mut self) -> Result<()> {
+        if matches!(self.service.service_type, ServiceType::Oneshot) {
+            return self.run_oneshot().await;
+        }
+
         while let Err(e) = self.spawn_service_process().await {
             match e.downcast_ref() {
                 Some(ServiceError::ProcessExited { status }) => {
@@ -147,6 +150,35 @@ impl ServiceManager {
                     info!("Received shutdown during restart delay for {}", self.name);
                     break;
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_oneshot(&mut self) -> Result<()> {
+        info!(target: &self.name, "Running oneshot service");
+        let result = self.spawn_service_process().await;
+
+        match result {
+            Ok(()) => {
+                let _ = self
+                    .event_tx
+                    .send(ServiceEvent::Ready(self.name.to_string()));
+            }
+            Err(e) => {
+                use std::os::unix::process::ExitStatusExt;
+                let status = e
+                    .downcast_ref::<ServiceError>()
+                    .map(|se| {
+                        let ServiceError::ProcessExited { status } = se;
+                        *status
+                    })
+                    .unwrap_or_else(|| ExitStatusExt::from_raw(1));
+                let _ = self
+                    .event_tx
+                    .send(ServiceEvent::Failed(self.name.to_string(), status));
+                return Err(e);
             }
         }
 
@@ -228,12 +260,59 @@ impl ServiceManager {
         }
 
         let (process, _guard) = self.create_service_child().await?;
+        let _guard = Arc::new(_guard);
 
-        if let Some(tx) = self.started_signal.take() {
-            let _ = tx.send(true);
+        let _ = self
+            .event_tx
+            .send(ServiceEvent::Spawned(self.name.to_string()));
+
+        if let Some(post_start) = &self.service.post_start {
+            info!(target: &self.name, "Running post-start script ({})", post_start);
+            let post_start = post_start.clone();
+            let config_dir_path = self.config_dir.path().clone();
+            let event_tx = self.event_tx.clone();
+            let name = self.name.to_string();
+            let post_start_handle = tokio::spawn(async move {
+                let result = Self::run_post_start(&post_start, config_dir_path).await;
+                if result.is_ok() {
+                    let _ = event_tx.send(ServiceEvent::Ready(name));
+                }
+                result
+            });
+
+            self.run_with_loggers(process).await?;
+            post_start_handle.await??;
+        } else {
+            let _ = self
+                .event_tx
+                .send(ServiceEvent::Ready(self.name.to_string()));
+            self.run_with_loggers(process).await?;
         }
 
-        self.run_with_loggers(process).await
+        Ok(())
+    }
+
+    async fn run_post_start(bin: &str, config_dir: PathBuf) -> Result<()> {
+        let config_dir = Arc::new(config_dir);
+        let mut cmd = Command::new(bin);
+        cmd.env("XDG_CONFIG_HOME", config_dir.as_ref())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .wrap_err_with(|| format!("Failed to spawn post-start script: {:?}", bin))?;
+        let status = child
+            .wait()
+            .await
+            .wrap_err("Failed to wait on post-start script")?;
+        if status.success() {
+            Ok(())
+        } else {
+            eyre::bail!(
+                "post-start script exited with non-zero status: {:?}",
+                status
+            );
+        }
     }
 
     /// Kill a service process gracefully
@@ -249,7 +328,10 @@ impl ServiceManager {
             if let Some(pid) = process.id() {
                 let pid = Pid::from_raw(pid as i32);
                 let _ = kill(pid, Signal::SIGTERM);
-                if timeout(timeout_duration, process.wait()).await.is_err() {
+                if tokio_timeout(timeout_duration, process.wait())
+                    .await
+                    .is_err()
+                {
                     let _ = kill(pid, Signal::SIGKILL);
                     let _ = process.wait().await;
                 }
