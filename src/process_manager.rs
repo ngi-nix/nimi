@@ -20,7 +20,7 @@ pub mod service;
 pub mod service_manager;
 pub mod settings;
 
-pub use service::Service;
+pub use service::{Service, ServiceType};
 pub use service_manager::ServiceManager;
 pub use settings::Settings;
 

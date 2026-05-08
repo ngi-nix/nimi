@@ -10,6 +10,19 @@ mod process;
 pub use config_data::{ConfigData, ConfigDataMap};
 pub use process::{ArgV, Process};
 
+/// Service type, similar to systemd's Type=.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceType {
+    /// Service runs continuously, expected to stay running (default).
+    #[default]
+    Simple,
+    /// Service runs once and exits. Considered "started" on successful exit.
+    Oneshot,
+    /// Service sends READY=1 via sd_notify when ready (not implemented, yet).
+    Notify,
+}
+
 /// Service Data Struct
 ///
 /// Rust based mirror of the services as defined in the [NixOS Modular Services
@@ -26,4 +39,13 @@ pub struct Service {
     /// Optional binary to run before each start of this service
     #[serde(rename = "preStart")]
     pub pre_start: Option<String>,
+
+    /// Optional binary to run after service starts. Runs once after spawn.
+    /// If it fails, the service fails. If it succeeds, the service is marked ready.
+    #[serde(rename = "postStart")]
+    pub post_start: Option<String>,
+
+    /// Service type (defaults to Simple)
+    #[serde(default, rename = "type")]
+    pub service_type: ServiceType,
 }
