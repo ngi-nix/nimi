@@ -268,6 +268,27 @@ impl ServiceManager {
             .iter()
             .map(|s| s.as_str())
             .collect();
+        for (name, cfg) in &self.service.config_data {
+            if cfg.enable {
+                info!(target: &**self.name, "CONFIG: {} -> {}", name, cfg.source.display());
+            }
+        }
+        let mut env_vars: Vec<(String, String)> = std::env::vars().collect();
+        env_vars.sort_by(|a, b| a.0.cmp(&b.0));
+        for (k, v) in env_vars {
+            info!(target: &**self.name, "ENVIRONMENT: {}={}", k, v);
+        }
+        info!(
+            target: &**self.name,
+            "XDG_CONFIG_HOME={}",
+            std::path::Path::new(&self.config_dir).display(),
+        );
+        info!(
+            target: &**self.name,
+            "Running: {} {}",
+            self.service.process.argv.binary(),
+            args.join(" ")
+        );
         self.spawn_process(self.service.process.argv.binary(), &args, &error_ctx)
             .await
     }
