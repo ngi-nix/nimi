@@ -260,21 +260,34 @@ impl ServiceManager {
             "Failed to start process for service: {:?}",
             self.service.process
         );
-        let args: Vec<&str> = self
+        let env: std::collections::HashMap<String, String> = std::env::vars()
+            .chain(std::iter::once((
+                "XDG_CONFIG_HOME".to_string(),
+                std::path::Path::new(&self.config_dir).to_string_lossy().into_owned(),
+            )))
+            .collect();
+        let expanded_args: Vec<String> = self
             .service
             .process
             .argv
             .args()
             .iter()
-            .map(|s| s.as_str())
+            .map(|s| {
+                shellexpand::full_with_context(s, || None::<String>, |var| {
+                    Ok::<_, std::convert::Infallible>(env.get(var).cloned())
+                })
+                .unwrap()
+                .into_owned()
+            })
             .collect();
+        let args: Vec<&str> = expanded_args.iter().map(|s| s.as_str()).collect();
         for (name, cfg) in &self.service.config_data {
             if cfg.enable {
                 info!(target: &**self.name, "Config: {} -> {}", name, cfg.source.display());
             }
         }
-        let mut env_vars: Vec<(String, String)> = std::env::vars().collect();
-        env_vars.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut env_vars: Vec<(&String, &String)> = env.iter().collect();
+        env_vars.sort_by(|a, b| a.0.cmp(b.0));
         for (k, v) in env_vars {
             info!(target: &**self.name, "Environment: {}={}", k, v);
         }
