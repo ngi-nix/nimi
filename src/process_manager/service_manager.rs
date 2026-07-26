@@ -103,7 +103,7 @@ impl ServiceManager {
         while let Err(e) = self.spawn_service_process().await {
             match e.downcast_ref() {
                 Some(ServiceError::ProcessExited { status }) => {
-                    info!("Process {} exited with status {}", &self.name, status)
+                    info!("Process {} exited with status {}", self.name, status)
                 }
                 None => return Err(e),
             }

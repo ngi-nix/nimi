@@ -106,7 +106,7 @@ impl Logger {
     }
 
     async fn create_logs_file(logs_dir: &Path, target: &str) -> Result<BufWriter<File>> {
-        let logs_path = logs_dir.join(format!("{}.txt", &target));
+        let logs_path = logs_dir.join(format!("{}.txt", target));
 
         let file = fs::OpenOptions::new()
             .write(true)
@@ -114,7 +114,7 @@ impl Logger {
             .create(true)
             .open(logs_path)
             .await
-            .wrap_err_with(|| format!("Failed to create logs file for {}", &target))?;
+            .wrap_err_with(|| format!("Failed to create logs file for {}", target))?;
 
         Ok(BufWriter::new(file))
     }
