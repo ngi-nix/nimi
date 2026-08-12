@@ -8,16 +8,22 @@ use futures::future::OptionFuture;
 use libmprocs::{ProcConfig, StopSignal, mprocs};
 use log::{debug, info};
 use std::process::Stdio;
-use std::{collections::HashMap, env, io::ErrorKind, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap, env, io::ErrorKind, path::PathBuf, process::ExitStatus, sync::Arc,
+};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::broadcast;
 use tokio::{fs, process::Command, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+
+use crate::config::ServiceOrdering;
+use crate::ordering;
 
 pub mod service;
 pub mod service_manager;
 pub mod settings;
 
-pub use service::Service;
+pub use service::{Service, ServiceType};
 pub use service_manager::ServiceManager;
 pub use settings::Settings;
 
@@ -26,18 +32,98 @@ use crate::process_manager::service_manager::{
 };
 use crate::subreaper::Subreaper;
 
+/// Lifecycle events emitted by services via the broadcast event bus.
+#[derive(Clone, Debug)]
+pub enum ServiceEvent {
+    /// Service process has been successfully spawned
+    Spawned(String),
+    /// Service is ready (emitted after postStart succeeds for simple, or on successful exit for oneshot)
+    Ready(String),
+    /// Service process failed with the given exit status
+    Failed(String, ExitStatus),
+    /// Service was stopped (graceful shutdown)
+    Stopped(String),
+    /// Service is being restarted
+    Restarting(String),
+}
+
 /// Process Manager Struct
 ///
 /// Responsible for starting the services and streaming their outputs to the console
 pub struct ProcessManager {
     services: HashMap<String, Service>,
     settings: Settings,
+    ordering: HashMap<String, ServiceOrdering>,
+    event_tx: broadcast::Sender<ServiceEvent>,
 }
 
 impl ProcessManager {
     /// Create a new process manager instance
-    pub fn new(services: HashMap<String, Service>, settings: Settings) -> Self {
-        Self { services, settings }
+    pub fn new(
+        services: HashMap<String, Service>,
+        settings: Settings,
+        ordering: HashMap<String, ServiceOrdering>,
+    ) -> Self {
+        Self {
+            services,
+            settings,
+            ordering,
+            event_tx: broadcast::Sender::new(32),
+        }
+    }
+
+    /// Validate that the ordering config is consistent with the service set.
+    ///
+    /// Checks that every name referenced in `ordering` (both keys and `after`
+    /// entries) corresponds to an actual service, and that the dependency graph
+    /// is acyclic.
+    pub fn validate_ordering(&self) -> Result<()> {
+        for (name, order) in &self.ordering {
+            eyre::ensure!(
+                self.services.contains_key(name),
+                "ordering references unknown service: {name}"
+            );
+            for dep in &order.after {
+                eyre::ensure!(
+                    self.services.contains_key(dep),
+                    "ordering.{name}.after references unknown service: {dep}"
+                );
+            }
+            for dep in &order.before {
+                eyre::ensure!(
+                    self.services.contains_key(dep),
+                    "ordering.{name}.before references unknown service: {dep}"
+                );
+            }
+        }
+
+        let unit_table = self.build_unit_table();
+
+        ordering::sanity_check_dependencies(&unit_table)
+            .map_err(|e| eyre::eyre!("Dependency cycle detected: {}", e))
+    }
+
+    fn build_unit_table(&self) -> HashMap<ordering::UnitId, ordering::Dependencies> {
+        use ordering::{Dependencies, UnitId};
+
+        let mut unit_table: HashMap<UnitId, Dependencies> = HashMap::new();
+
+        for name in self.services.keys() {
+            unit_table.insert(UnitId::new(name), Dependencies::default());
+        }
+
+        for (name, order) in &self.ordering {
+            let deps = unit_table.entry(UnitId::new(name)).or_default();
+
+            for dep in &order.after {
+                deps.after.push(UnitId::new(dep));
+            }
+            for dep in &order.before {
+                deps.before.push(UnitId::new(dep));
+            }
+        }
+
+        unit_table
     }
 
     async fn run_startup_process(&self, bin: &str, cancel_tok: &CancellationToken) -> Result<()> {
@@ -114,11 +200,15 @@ impl ProcessManager {
 
     /// Spawn Child Processes
     ///
-    /// Spawns every service this process manager manages into a `JoinSet`
+    /// Spawns every service this process manager manages into a `JoinSet`,
+    /// respecting `ordering` constraints. Services wait for their `after`
+    /// dependencies to have spawned before starting.
     pub async fn spawn_child_processes(
         self,
         cancel_tok: &CancellationToken,
     ) -> Result<JoinSet<Result<()>>> {
+        self.validate_ordering()?;
+
         let mut join_set = tokio::task::JoinSet::new();
 
         let settings = Arc::new(self.settings);
@@ -135,19 +225,76 @@ impl ProcessManager {
         );
         let tmp_dir = Arc::new(env::temp_dir());
 
+        let after_deps: HashMap<String, Vec<String>> = self
+            .services
+            .keys()
+            .map(|name| {
+                let deps = self
+                    .ordering
+                    .get(name)
+                    .map(|o| o.after.clone())
+                    .unwrap_or_default();
+                (name.clone(), deps)
+            })
+            .collect();
+
         for (name, service) in self.services {
+            let deps = after_deps.get(&name).cloned().unwrap_or_default();
+            let cancel = cancel_tok.clone();
+            let event_tx = self.event_tx.clone();
+            let mut event_rx = self.event_tx.subscribe();
+
             let opts = ServiceManagerOpts {
                 logs_dir: Arc::clone(&logs_dir),
                 tmp_dir: Arc::clone(&tmp_dir),
 
                 settings: Arc::clone(&settings),
 
-                name: Arc::new(name),
+                name: Arc::new(name.clone()),
                 service,
                 cancel_tok: cancel_tok.clone(),
+                event_tx: event_tx.clone(),
             };
 
-            join_set.spawn(async move { ServiceManager::new(opts).await?.run().await });
+            join_set.spawn(async move {
+                // Wait for all `after` dependencies to be satisfied.
+                // For simple deps: satisfied when they are spawned.
+                // For oneshot deps: satisfied when they complete (Ready or Failed).
+                let mut satisfied: HashMap<String, bool> =
+                    deps.iter().map(|d| (d.clone(), false)).collect();
+
+                loop {
+                    let all_done = satisfied.values().all(|v| *v);
+                    if all_done { 
+                        break;
+                    }
+
+                    tokio::select! {
+                        event = event_rx.recv() => {
+                            let event = event.map_err(|e| eyre::eyre!("event channel closed: {e}"))?;
+                            match event {
+                                ServiceEvent::Spawned(ref dep) => {
+                                    // Simple deps are satisfied on spawn
+                                    if let Some(sat) = satisfied.get_mut(dep) {
+                                        *sat = true;
+                                    }
+                                }
+                                ServiceEvent::Ready(ref dep) | ServiceEvent::Failed(ref dep, _) => {
+                                    // Oneshot deps are satisfied on completion
+                                    if let Some(sat) = satisfied.get_mut(dep) {
+                                        *sat = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ = cancel.cancelled() => return Ok(()),
+                    }
+                }
+
+                let mut manager = ServiceManager::new(opts).await?;
+                manager.run().await
+            });
         }
 
         Ok(join_set)
@@ -234,21 +381,29 @@ impl From<ProcessManager> for Vec<ProcConfig> {
         value
             .services
             .into_iter()
-            .map(|(name, service)| ProcConfig {
-                name,
-                cmd: service.process.into(),
-                cwd: std::env::current_dir().ok().map(|p| p.into_os_string()),
-                env: None,
-                autostart: true,
-                autorestart: value.settings.autorestart(),
+            .map(|(name, service)| {
+                let deps = value
+                    .ordering
+                    .get(&name)
+                    .map(|o| o.after.clone())
+                    .unwrap_or_default();
 
-                stop: StopSignal::SIGTERM,
+                ProcConfig {
+                    name,
+                    cmd: service.process.into(),
+                    cwd: std::env::current_dir().ok().map(|p| p.into_os_string()),
+                    env: None,
+                    autostart: true,
+                    autorestart: value.settings.autorestart(),
 
-                deps: Vec::default(),
+                    stop: StopSignal::SIGTERM,
 
-                mouse_scroll_speed: 5,
-                scrollback_len: 1000,
-                log: None,
+                    deps,
+
+                    mouse_scroll_speed: 5,
+                    scrollback_len: 1000,
+                    log: None,
+                }
             })
             .collect()
     }

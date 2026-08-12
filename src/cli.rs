@@ -93,7 +93,8 @@ impl Cli {
             Command::Run { tui } => {
                 info!("Launching process manager...");
 
-                let proc_man = ProcessManager::new(config.services, config.settings);
+                let proc_man =
+                    ProcessManager::new(config.services, config.settings, config.ordering);
 
                 if tui {
                     proc_man.run_mprocs().await
