@@ -6,7 +6,7 @@
 }:
 testers.runNixOSTest {
   name = "test-nimi-nixos";
-  nodes.machine = {
+  containers.machine = {
     imports = [
       (lib.modules.importApply ../modules/nixos.nix { inherit nix2container; })
     ];
