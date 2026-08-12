@@ -103,9 +103,9 @@ rec {
   toNimiJson =
     evaluatedConfig:
     let
-      inputJSON = builtins.addErrorContext errorCtxs.failedConversionToJSON (
-        builtins.toJSON evaluatedConfig
-      );
+      withoutFns = lib.filterAttrsRecursive (_: v: !lib.isFunction v) evaluatedConfig;
+
+      inputJSON = builtins.addErrorContext errorCtxs.failedConversionToJSON (builtins.toJSON withoutFns);
 
       formattedJSON =
         runCommandLocal "nimi-config-formatted.json"
