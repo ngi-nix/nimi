@@ -32,5 +32,5 @@ pkgs.mkShell {
 
       mdbook
     ]
-    ++ (lib.optional (!stdenv.isDarwin) moldHook);
+    ++ (lib.optional (!stdenv.hostPlatform.isDarwin) moldHook);
 }
