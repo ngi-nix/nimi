@@ -57,8 +57,8 @@ pub enum ServiceError {
 pub struct ServiceManagerOpts {
     /// Directory to store logs in
     pub logs_dir: Arc<Option<PathBuf>>,
-    /// Temporary directory
-    pub tmp_dir: Arc<PathBuf>,
+    /// Pre-created configuration directory for this service
+    pub config_dir: ConfigDir,
 
     /// Process manager settings
     pub settings: Arc<Settings>,
@@ -78,11 +78,9 @@ impl ServiceManager {
     ///
     /// This creates the corresponding processes and supervises the operation for a given
     /// `Service`.
-    ///
-    /// This also produces a `ConfigDir` instance per service.
-    pub async fn new(opts: ServiceManagerOpts) -> Result<Self> {
-        Ok(Self {
-            config_dir: ConfigDir::new(&opts.tmp_dir, &opts.service.config_data).await?,
+    pub fn new(opts: ServiceManagerOpts) -> Self {
+        Self {
+            config_dir: opts.config_dir,
 
             settings: opts.settings,
             cancel_tok: opts.cancel_tok,
@@ -92,7 +90,7 @@ impl ServiceManager {
 
             current_restart_count: 0,
             logs_dir: opts.logs_dir,
-        })
+        }
     }
 
     /// Run the `Service` managed by this `ServiceManager`

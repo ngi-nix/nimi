@@ -118,6 +118,7 @@ impl ProcessManager {
     pub async fn spawn_child_processes(
         self,
         cancel_tok: &CancellationToken,
+        mut config_dirs: HashMap<String, ConfigDir>,
     ) -> Result<JoinSet<Result<()>>> {
         let mut join_set = tokio::task::JoinSet::new();
 
@@ -133,12 +134,15 @@ impl ProcessManager {
             .await
             .transpose()?,
         );
-        let tmp_dir = Arc::new(env::temp_dir());
 
         for (name, service) in self.services {
+            let config_dir = config_dirs
+                .remove(&name)
+                .ok_or_else(|| eyre::eyre!("Missing pre-created config dir for service {name}"))?;
+
             let opts = ServiceManagerOpts {
                 logs_dir: Arc::clone(&logs_dir),
-                tmp_dir: Arc::clone(&tmp_dir),
+                config_dir,
 
                 settings: Arc::clone(&settings),
 
@@ -147,7 +151,7 @@ impl ProcessManager {
                 cancel_tok: cancel_tok.clone(),
             };
 
-            join_set.spawn(async move { ServiceManager::new(opts).await?.run().await });
+            join_set.spawn(async move { ServiceManager::new(opts).run().await });
         }
 
         Ok(join_set)
@@ -176,6 +180,16 @@ impl ProcessManager {
         let cancel_tok = CancellationToken::new();
         self.spawn_shutdown_task(&cancel_tok);
 
+        let tmp_dir = env::temp_dir();
+
+        let mut service_config_dirs = HashMap::new();
+        for (name, service) in &self.services {
+            let config_dir = ConfigDir::new(&tmp_dir, &service.config_data)
+                .await
+                .wrap_err_with(|| format!("Failed to create config dir for {name}"))?;
+            service_config_dirs.insert(name.clone(), config_dir);
+        }
+
         if let Some(startup) = &self.settings.startup.run_on_startup {
             info!("Running startup binary ({})...", startup);
             self.run_startup_process(startup, &cancel_tok)
@@ -183,7 +197,9 @@ impl ProcessManager {
                 .wrap_err("Failed to run startup process")?;
         }
 
-        let mut services_set = self.spawn_child_processes(&cancel_tok).await?;
+        let mut services_set = self
+            .spawn_child_processes(&cancel_tok, service_config_dirs)
+            .await?;
 
         while let Some(res) = services_set.join_next().await {
             let flat: Result<()> = res.map_err(Into::into).and_then(std::convert::identity);
@@ -207,19 +223,19 @@ impl ProcessManager {
         let cancel_tok = CancellationToken::new();
         self.spawn_shutdown_task(&cancel_tok);
 
-        if let Some(startup) = &self.settings.startup.run_on_startup {
-            info!("Running startup binary ({})...", startup);
-            self.run_startup_process(startup, &cancel_tok)
-                .await
-                .wrap_err("Failed to run startup process")?;
-        }
-
         let tmp_dir = env::temp_dir();
 
         for (name, service) in &self.services {
             ConfigDir::new(&tmp_dir, &service.config_data)
                 .await
-                .wrap_err_with(|| format!("Failed to create config dir for {}", name))?;
+                .wrap_err_with(|| format!("Failed to create config dir for {name}"))?;
+        }
+
+        if let Some(startup) = &self.settings.startup.run_on_startup {
+            info!("Running startup binary ({})...", startup);
+            self.run_startup_process(startup, &cancel_tok)
+                .await
+                .wrap_err("Failed to run startup process")?;
         }
 
         mprocs::run_with_config(self.into(), libmprocs::Settings::default())
