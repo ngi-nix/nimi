@@ -21,6 +21,9 @@ pub struct Settings {
 
     /// The logging specific settings
     pub logging: Logging,
+
+    /// Readiness check settings
+    pub ready: Ready,
 }
 
 impl Settings {
@@ -71,6 +74,18 @@ impl<'de> Deserialize<'de> for Logging {
             logs_dir: raw.enable.then_some(raw.logs_dir),
         })
     }
+}
+
+/// Ready Settings Struct
+///
+/// Configuration for readiness checks
+#[serde_as]
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Ready {
+    /// Maximum time to wait for readiness check to pass (in milliseconds)
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
+    #[serde(rename = "timeout")]
+    pub timeout: Duration,
 }
 
 /// Logging raw struct matching nix representation

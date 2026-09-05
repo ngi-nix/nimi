@@ -12,7 +12,8 @@ use std::{
 use eyre::{Context, Result};
 use log::{debug, info};
 use thiserror::Error;
-use tokio::time::timeout;
+use tokio::sync::watch;
+use tokio::time::timeout as tokio_timeout;
 use tokio::{
     process::{Child, Command},
     task::JoinSet,
@@ -40,6 +41,12 @@ pub struct ServiceManager {
 
     config_dir: ConfigDir,
     logs_dir: Arc<Option<PathBuf>>,
+
+    /// Fires once after the first successful process spawn to unblock dependents
+    started_signal: Option<watch::Sender<bool>>,
+
+    /// Fires once after readiness check passes
+    ready_signal: Option<watch::Sender<bool>>,
 }
 
 /// Errors which can occur during service management
@@ -71,15 +78,16 @@ pub struct ServiceManagerOpts {
 
     /// Cancellation token
     pub cancel_tok: CancellationToken,
+
+    /// Channel to signal when the first process spawn succeeds
+    pub started_signal: Option<watch::Sender<bool>>,
+
+    /// Channel to signal when readiness check passes
+    pub ready_signal: Option<watch::Sender<bool>>,
 }
 
 impl ServiceManager {
     /// Creates a new Service Manager
-    ///
-    /// This creates the corresponding processes and supervises the operation for a given
-    /// `Service`.
-    ///
-    /// This also produces a `ConfigDir` instance per service.
     pub async fn new(opts: ServiceManagerOpts) -> Result<Self> {
         Ok(Self {
             config_dir: ConfigDir::new(&opts.tmp_dir, &opts.service.config_data).await?,
@@ -92,6 +100,8 @@ impl ServiceManager {
 
             current_restart_count: 0,
             logs_dir: opts.logs_dir,
+            started_signal: opts.started_signal,
+            ready_signal: opts.ready_signal,
         })
     }
 
@@ -220,7 +230,139 @@ impl ServiceManager {
         }
 
         let (process, _guard) = self.create_service_child().await?;
-        self.run_with_loggers(process).await
+        let _guard = Arc::new(_guard);
+
+        if let Some(tx) = self.started_signal.take() {
+            let _ = tx.send(true);
+        }
+
+        let service_result: eyre::Result<()>;
+        let ready_result: eyre::Result<()>;
+
+        if let Some(ready_check) = &self.service.ready_check {
+            let timeout = self.settings.ready.timeout;
+            info!(target: &self.name, "Running readiness check ({})", ready_check);
+
+            let ready_check = ready_check.clone();
+            let config_dir_path = self.config_dir.path().clone();
+            let ready_signal = self.ready_signal.take();
+            let ready_handle = tokio::spawn(async move {
+                let result = Self::run_ready_check_with_timeout_from_parts(
+                    &ready_check,
+                    timeout,
+                    config_dir_path,
+                )
+                .await;
+                if result.is_ok()
+                    && let Some(tx) = ready_signal
+                {
+                    let _ = tx.send(true);
+                }
+                result
+            });
+
+            self.run_with_loggers(process).await?;
+            ready_handle.await??;
+
+            service_result = Ok(());
+            ready_result = Ok(());
+        } else {
+            return self.run_with_loggers(process).await;
+        }
+
+        service_result?;
+        ready_result?;
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn run_with_loggers_from_parts(
+        mut process: Child,
+        name: Arc<String>,
+        logs_dir: Arc<Option<PathBuf>>,
+    ) -> Result<()> {
+        let mut set = JoinSet::new();
+
+        Logger::Stdout.start(
+            &mut process.stdout,
+            Arc::clone(&name),
+            Arc::clone(&logs_dir),
+            &mut set,
+        )?;
+        Logger::Stderr.start(
+            &mut process.stderr,
+            Arc::clone(&name),
+            Arc::clone(&logs_dir),
+            &mut set,
+        )?;
+
+        let status = process
+            .wait()
+            .await
+            .wrap_err("Failed to get process status")?;
+        eyre::ensure!(status.success(), ServiceError::ProcessExited { status });
+
+        set.join_all().await.into_iter().collect()
+    }
+
+    async fn run_ready_check_with_timeout_from_parts(
+        bin: &str,
+        timeout: std::time::Duration,
+        config_dir: PathBuf,
+    ) -> Result<()> {
+        let config_dir = Arc::new(config_dir);
+        let check_result = tokio_timeout(timeout, async {
+            loop {
+                let cd = Arc::clone(&config_dir);
+                let mut cmd = Command::new(bin);
+                cmd.env("XDG_CONFIG_HOME", cd.as_ref())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = cmd
+                    .spawn()
+                    .wrap_err_with(|| format!("Failed to spawn readiness check: {:?}", bin))?;
+                let status = child
+                    .wait()
+                    .await
+                    .wrap_err("Failed to wait on readiness check")?;
+                if status.success() {
+                    return Ok::<_, eyre::Report>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+
+        match check_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => eyre::bail!("readiness check timed out after {:?}", timeout),
+        }
+    }
+
+    /// Spawn a process (internal helper)
+    #[allow(dead_code)]
+    async fn spawn_process_inner(
+        &self,
+        binary: &str,
+        args: &[&str],
+        error_context: &str,
+    ) -> Result<(Child, ChildGuard)> {
+        let _pause = Subreaper::pause_reaping();
+        let mut cmd = Command::new(binary);
+        if !args.is_empty() {
+            cmd.args(args);
+        }
+        let child = cmd
+            .env("XDG_CONFIG_HOME", &self.config_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .wrap_err_with(|| error_context.to_string())?;
+        let guard = Subreaper::track_child(child.id()).wrap_err("Failed to track child")?;
+        Ok((child, guard))
     }
 
     /// Kill a service process gracefully
@@ -236,7 +378,10 @@ impl ServiceManager {
             if let Some(pid) = process.id() {
                 let pid = Pid::from_raw(pid as i32);
                 let _ = kill(pid, Signal::SIGTERM);
-                if timeout(timeout_duration, process.wait()).await.is_err() {
+                if tokio_timeout(timeout_duration, process.wait())
+                    .await
+                    .is_err()
+                {
                     let _ = kill(pid, Signal::SIGKILL);
                     let _ = process.wait().await;
                 }
